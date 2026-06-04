@@ -4,9 +4,14 @@ Cloudflare Worker for proxying `npm` and `pip` package traffic through a single 
 
 ## Endpoints
 
-- `https://<your-worker>/npm/` proxies the npm registry and rewrites tarball URLs so package downloads stay on your Worker domain.
-- `https://<your-worker>/pip/simple` proxies the PyPI simple index and rewrites package file links through the Worker.
-- `https://<your-worker>/pip/pypi/<package>/json` proxies the PyPI JSON API.
+| Path | Upstream | Notes |
+|---|---|---|
+| `/npm/<package>` | `registry.npmjs.org` | Full metadata JSON; tarball URLs rewritten to the Worker domain |
+| `/npm/<package>/-/<file>.tgz` | `registry.npmjs.org` | Tarball download, transparently proxied |
+| `/pip/simple/<package>/` | `pypi.org/simple/` | HTML simple index; absolute and root-relative download links rewritten; `#sha256=` fragments preserved |
+| `/pip/pypi/<package>/json` | `pypi.org/pypi/` | PyPI JSON API; download URLs rewritten |
+| `/pip/packages/*` | `files.pythonhosted.org` | Actual wheel / sdist file download |
+| `/healthz` | — | Returns `ok` |
 
 ## Local development
 
@@ -17,11 +22,16 @@ npm run dev
 
 The local Worker runs at `http://localhost:8787`.
 
+```bash
+npm test          # watch mode
+npm test -- --run # single run
+```
+
 ## Client configuration
 
 ```bash
 npm config set registry https://<your-worker-domain>/npm/
-pip config set global.index-url https://<your-worker-domain>/pip/simple
+pip config set global.index-url https://<your-worker-domain>/pip/simple/
 ```
 
 ## Deploy to Cloudflare
