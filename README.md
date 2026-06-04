@@ -66,48 +66,16 @@ pip install --index-url https://<your-worker-domain>/pip/simple/ <package>
 index-url = https://<your-worker-domain>/pip/simple/
 ```
 
-## Deploy to Cloudflare (manual)
+## Deploy to Cloudflare
 
-Bump the version in `package.json`, then:
+Deployment is handled automatically by **Cloudflare Workers Builds** on every push to `main`.
+
+For local/manual deployment:
 
 ```bash
 npm run deploy
 ```
 
-This creates a `vX.Y.Z` git tag from the current `version` field and pushes it, which triggers the GitHub Actions workflow (test → deploy).
+## GitHub Actions (CI)
 
-## Automatic deployment via GitHub Actions
-
-Push a tag in the form `vX.Y.Z` to trigger tests followed by an automatic deploy:
-
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-### Prerequisites — two secrets needed
-
-#### 1. `CLOUDFLARE_API_TOKEN`
-
-Create a scoped API token at **[Cloudflare Dashboard → My Profile → API Tokens](https://dash.cloudflare.com/profile/api-tokens)**:
-
-1. Click **Create Token** → **Use template** → choose **Edit Cloudflare Workers**
-2. Under **Account Resources**, select your account
-3. Under **Zone Resources**, select **All zones** (or restrict to the zone hosting the Worker's route if you use a custom domain)
-4. Click **Continue to summary** → **Create Token**
-5. Copy the token value — it won't be shown again
-
-#### 2. `CLOUDFLARE_ACCOUNT_ID`
-
-Found in **Cloudflare Dashboard → (select your account) → Overview**; the Account ID is displayed in the right sidebar.
-
-### Add secrets to GitHub
-
-In your GitHub repository go to **Settings → Secrets and variables → Actions → New repository secret** and add:
-
-| Secret name | Value |
-|---|---|
-| `CLOUDFLARE_API_TOKEN` | Token from step 1 above |
-| `CLOUDFLARE_ACCOUNT_ID` | Your Cloudflare account ID |
-
-Once both secrets are set, push a `vX.Y.Z` tag to trigger the first deployment.
+Every push and pull request runs the test suite automatically. See [.github/workflows/deploy.yml](.github/workflows/deploy.yml).
