@@ -109,6 +109,83 @@ describe("package proxy worker", () => {
 		expect(body).toContain('href="https://packages.example.com/pip/packages/ab/cd/requests-2.28.1.tar.gz#sha256=abc"');
 	});
 
+	it("routes /npm without trailing slash (npm ping uses bare /npm path)", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn().mockResolvedValue(
+				new Response(JSON.stringify({}), { headers: { "content-type": "application/json" } }),
+			),
+		);
+
+		const request = new IncomingRequest("https://packages.example.com/npm");
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		// /npm without trailing slash should be proxied, not return 404
+		expect(response.status).toBe(200);
+	});
+
+	it("follows upstream redirects instead of returning 302 to client (internal isolation)", async () => {
+		// With redirect:"follow", fetch() transparently follows the upstream 302 → CDN
+		// and returns the final 200. The client should never see a 3xx.
+		vi.stubGlobal(
+			"fetch",
+			vi.fn().mockResolvedValue(
+				new Response("wheel-binary-data", {
+					status: 200,
+					headers: { "content-type": "application/zip" },
+				}),
+			),
+		);
+
+		const request = new IncomingRequest(
+			"https://packages.example.com/pip/packages/ab/cd/requests-2.28.1-py3-none-any.whl",
+		);
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.status).toBe(200);
+	});
+
+	it("sets immutable Cache-Control on versioned package files", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn().mockResolvedValue(
+				new Response("binary", { status: 200, headers: { "content-type": "application/zip" } }),
+			),
+		);
+
+		const request = new IncomingRequest(
+			"https://packages.example.com/pip/packages/ab/cd/requests-2.28.1-py3-none-any.whl",
+		);
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+	});
+
+	it("sets short Cache-Control on metadata responses", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn().mockResolvedValue(
+				new Response(
+					'<html><body><a href="/packages/ab/cd/demo-1.0.tar.gz">demo</a></body></html>',
+					{ headers: { "content-type": "text/html; charset=utf-8" } },
+				),
+			),
+		);
+
+		const request = new IncomingRequest("https://packages.example.com/pip/simple/demo/");
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, env, ctx);
+		await waitOnExecutionContext(ctx);
+
+		expect(response.headers.get("cache-control")).toBe("public, max-age=60");
+	});
+
 	it("serves the worker entrypoint in integration mode", async () => {
 		const response = await SELF.fetch("https://example.com/");
 		expect(response.status).toBe(200);

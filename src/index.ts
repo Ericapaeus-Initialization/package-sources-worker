@@ -2,10 +2,13 @@ const NPM_ORIGIN = "https://registry.npmjs.org";
 const PYPI_ORIGIN = "https://pypi.org";
 const PYPI_FILES_ORIGIN = "https://files.pythonhosted.org";
 
+const IMMUTABLE_TTL = 31536000; // 1 year – versioned package files never change
+const METADATA_TTL = 60; // 60 s   – metadata may change when new versions are published
+
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 export default {
-	async fetch(request, _env, _ctx): Promise<Response> {
+	async fetch(request, _env, ctx): Promise<Response> {
 		if (request.method === "OPTIONS") {
 			return new Response(null, {
 				status: 204,
@@ -24,9 +27,18 @@ export default {
 		}
 
 		const url = new URL(request.url);
+		const ttl = cacheTtl(url.pathname);
+
+		// Serve from edge cache when available (Cache API supports GET only)
+		if (request.method === "GET") {
+			const cached = await caches.default.match(request);
+			if (cached) return cached;
+		}
+
+		let response: Response;
 
 		if (url.pathname === "/") {
-			return json({
+			response = json({
 				name: "package-sources-worker",
 				service: "Cloudflare Worker proxy for npm and pip registries",
 				endpoints: {
@@ -39,42 +51,45 @@ export default {
 					pip: `pip config set global.index-url ${url.origin}/pip/simple`,
 				},
 			});
+		} else if (url.pathname === "/npm" || url.pathname.startsWith("/npm/")) {
+			response = await proxyNpm(request, url, ttl);
+		} else if (url.pathname === "/pip" || url.pathname.startsWith("/pip/")) {
+			response = await proxyPip(request, url, ttl);
+		} else {
+			response = json(
+				{
+					error: "not_found",
+					message: "Use /npm/* or /pip/*.",
+				},
+				404,
+			);
 		}
 
-		if (url.pathname.startsWith("/npm/")) {
-			return proxyNpm(request, url);
+		// Populate edge cache for successful GET responses
+		if (request.method === "GET" && response.status === 200) {
+			ctx.waitUntil(caches.default.put(request, response.clone()));
 		}
 
-		if (url.pathname === "/pip" || url.pathname.startsWith("/pip/")) {
-			return proxyPip(request, url);
-		}
-
-		return json(
-			{
-				error: "not_found",
-				message: "Use /npm/* or /pip/*.",
-			},
-			404,
-		);
+		return response;
 	},
 } satisfies ExportedHandler<Env>;
 
-async function proxyNpm(request: Request, url: URL): Promise<Response> {
+async function proxyNpm(request: Request, url: URL, ttl: number): Promise<Response> {
 	const upstreamUrl = new URL(url.pathname.replace(/^\/npm/, "") + url.search, NPM_ORIGIN);
 	const upstreamResponse = await fetchUpstream(request, upstreamUrl);
 	const contentType = upstreamResponse.headers.get("content-type") || "";
 
 	if (!contentType.includes("application/json")) {
-		return buildProxyResponse(upstreamResponse, rewriteLocation(upstreamResponse.headers, url.origin));
+		return buildProxyResponse(upstreamResponse, ttl);
 	}
 
 	const payload = (await upstreamResponse.json()) as JsonValue;
 	const rewritten = rewriteJsonStrings(payload, (value) => rewriteRegistryUrl(value, url.origin));
 
-	return jsonResponse(rewritten, upstreamResponse.status, upstreamResponse.headers, url.origin);
+	return jsonResponse(rewritten, upstreamResponse.status, upstreamResponse.headers, url.origin, ttl);
 }
 
-async function proxyPip(request: Request, url: URL): Promise<Response> {
+async function proxyPip(request: Request, url: URL, ttl: number): Promise<Response> {
 	const pipPath = url.pathname.replace(/^\/pip/, "") || "/";
 	const upstreamUrl = resolvePipUpstreamUrl(pipPath, url.search);
 
@@ -94,16 +109,16 @@ async function proxyPip(request: Request, url: URL): Promise<Response> {
 	if (contentType.includes("text/html")) {
 		const html = await upstreamResponse.text();
 		const rewritten = rewriteTextUrls(html, url.origin);
-		return textResponse(rewritten, upstreamResponse.status, upstreamResponse.headers, url.origin, contentType);
+		return textResponse(rewritten, upstreamResponse.status, upstreamResponse.headers, url.origin, contentType, ttl);
 	}
 
 	if (contentType.includes("application/json")) {
 		const payload = (await upstreamResponse.json()) as JsonValue;
 		const rewritten = rewriteJsonStrings(payload, (value) => rewritePipUrl(value, url.origin));
-		return jsonResponse(rewritten, upstreamResponse.status, upstreamResponse.headers, url.origin);
+		return jsonResponse(rewritten, upstreamResponse.status, upstreamResponse.headers, url.origin, ttl);
 	}
 
-	return buildProxyResponse(upstreamResponse, rewriteLocation(upstreamResponse.headers, url.origin));
+	return buildProxyResponse(upstreamResponse, ttl);
 }
 
 function resolvePipUpstreamUrl(pipPath: string, search: string): URL | null {
@@ -173,26 +188,17 @@ function rewriteTextUrls(value: string, origin: string): string {
 		.replace(/(href|src)='\/simple\//g, `$1='${origin}/pip/simple/`);
 }
 
-function rewriteLocation(headers: Headers, origin: string): Headers {
-	const nextHeaders = cloneResponseHeaders(headers);
-	const location = nextHeaders.get("location");
-
-	if (location) {
-		nextHeaders.set("location", rewritePipUrl(rewriteRegistryUrl(location, origin), origin));
-	}
-
-	applyCorsHeaders(nextHeaders);
-	return nextHeaders;
-}
-
 async function fetchUpstream(request: Request, upstreamUrl: URL): Promise<Response> {
 	const headers = new Headers(request.headers);
 	headers.delete("host");
 
+	// redirect:"follow" ensures the Worker itself follows any CDN/redirect hops
+	// so 302 responses never leak back to the client, keeping all traffic
+	// inside the Worker (required for internal network isolation).
 	return fetch(upstreamUrl, {
 		method: request.method,
 		headers,
-		redirect: "manual",
+		redirect: "follow",
 	});
 }
 
@@ -206,7 +212,7 @@ function json(body: unknown, status = 200): Response {
 	});
 }
 
-function jsonResponse(body: JsonValue, status: number, headers: Headers, origin: string): Response {
+function jsonResponse(body: JsonValue, status: number, headers: Headers, origin: string, ttl: number): Response {
 	const nextHeaders = cloneResponseHeaders(headers);
 	nextHeaders.set("content-type", "application/json; charset=utf-8");
 	nextHeaders.delete("content-encoding");
@@ -215,6 +221,7 @@ function jsonResponse(body: JsonValue, status: number, headers: Headers, origin:
 	nextHeaders.delete("cf-cache-status");
 	applyCorsHeaders(nextHeaders);
 	nextHeaders.set("x-proxy-origin", origin);
+	nextHeaders.set("cache-control", cacheControlDirective(ttl));
 
 	return new Response(JSON.stringify(body), {
 		status,
@@ -222,7 +229,7 @@ function jsonResponse(body: JsonValue, status: number, headers: Headers, origin:
 	});
 }
 
-function textResponse(body: string, status: number, headers: Headers, origin: string, contentType: string): Response {
+function textResponse(body: string, status: number, headers: Headers, origin: string, contentType: string, ttl: number): Response {
 	const nextHeaders = cloneResponseHeaders(headers);
 	nextHeaders.set("content-type", contentType || "text/html; charset=utf-8");
 	nextHeaders.delete("content-encoding");
@@ -231,6 +238,7 @@ function textResponse(body: string, status: number, headers: Headers, origin: st
 	nextHeaders.delete("cf-cache-status");
 	applyCorsHeaders(nextHeaders);
 	nextHeaders.set("x-proxy-origin", origin);
+	nextHeaders.set("cache-control", cacheControlDirective(ttl));
 
 	return new Response(body, {
 		status,
@@ -238,7 +246,9 @@ function textResponse(body: string, status: number, headers: Headers, origin: st
 	});
 }
 
-function buildProxyResponse(upstreamResponse: Response, headers: Headers): Response {
+function buildProxyResponse(upstreamResponse: Response, ttl: number): Response {
+	const headers = new Headers(upstreamResponse.headers);
+	headers.set("cache-control", cacheControlDirective(ttl));
 	return new Response(upstreamResponse.body, {
 		status: upstreamResponse.status,
 		headers,
@@ -249,6 +259,16 @@ function cloneResponseHeaders(headers: Headers): Headers {
 	const nextHeaders = new Headers(headers);
 	nextHeaders.delete("content-length");
 	return nextHeaders;
+}
+
+function cacheTtl(pathname: string): number {
+	if (pathname.startsWith("/pip/packages/")) return IMMUTABLE_TTL;
+	if (/\/npm\/.+\/-\/.+\.tgz$/.test(pathname)) return IMMUTABLE_TTL;
+	return METADATA_TTL;
+}
+
+function cacheControlDirective(ttl: number): string {
+	return ttl >= IMMUTABLE_TTL ? `public, max-age=${ttl}, immutable` : `public, max-age=${ttl}`;
 }
 
 const CORS_HEADERS: Record<string, string> = {
